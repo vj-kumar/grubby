@@ -103,6 +103,8 @@ enum lineType_e {
 	LT_INITRD_16 = 1 << 23,
 	LT_DEVTREE = 1 << 24,
 	LT_UNKNOWN = 1 << 25,
+	LT_CHAINLOADER = 1 << 26,
+	LT_SEARCH = 1 << 27,
 };
 
 struct singleLine {
@@ -132,6 +134,8 @@ struct singleEntry {
 #define NEED_MB      (1 << 4)
 #define NEED_END     (1 << 5)
 #define NEED_DEVTREE (1 << 6)
+#define NEED_CHAINLOADER (1 << 7)
+#define NEED_SEARCH  (1 << 8)
 
 #define MAIN_DEFAULT	    (1 << 0)
 #define FIRST_ENTRY_INDEX    0	/* boot entry index value begin and increment
@@ -181,6 +185,7 @@ struct configFileInfo {
 	int mbConcatArgs;
 	int mbAllowExtraInitRds;
 	char *envFile;
+	int isChainloader;
 };
 
 struct keywordTypes grubKeywords[] = {
@@ -247,6 +252,8 @@ struct keywordTypes grub2Keywords[] = {
 	{"module", LT_MBMODULE, ' '},
 	{"kernel", LT_HYPER, ' '},
 	{"devicetree", LT_DEVTREE, ' '},
+	{"chainloader", LT_CHAINLOADER, ' '},
+	{"search", LT_SEARCH, ' '},
 	{NULL, 0, 0},
 };
 
@@ -511,6 +518,7 @@ struct configFileInfo grub2ConfigType = {
 	.mbHyperFirst = 1,
 	.mbInitRdIsModule = 1,
 	.mbAllowExtraInitRds = 1,
+	.isChainloader = 0,
 };
 
 struct keywordTypes yabootKeywords[] = {
@@ -680,8 +688,8 @@ struct grubConfig {
 	int fallbackImage;	/* just like defaultImage */
 	int flags;
 	struct configFileInfo *cfi;
-	int isModified;		/* assumes only one entry added
-				   per invocation of grubby */
+	int isModified;		/* assumes only one entry added per invocation of grubby */
+	int isChainloader;
 };
 
 blkid_cache blkid;
@@ -1526,7 +1534,7 @@ static struct grubConfig *readConfig(const char *inName,
 
 		/* If we find a generic config option which should live at the
 		   top of the file, move it there. Old versions of grubby were
-		   probably responsible for putting new images in the wrong 
+		   probably responsible for putting new images in the wrong
 		   place in front of it anyway. */
 		if (sawEntry && line->type == LT_GENERIC) {
 			struct singleLine **l = &cfg->theLines;
@@ -2361,7 +2369,7 @@ int suitableImage(struct singleEntry *entry, const char *bootPrefix,
 	return 1;
 }
 
-/* returns the first match on or after the one pointed to by index (if index 
+/* returns the first match on or after the one pointed to by index (if index
    is not NULL) which is not marked as skip */
 struct singleEntry *findEntryByPath(struct grubConfig *config,
 				    const char *kernel, const char *prefix,
@@ -2372,6 +2380,9 @@ struct singleEntry *findEntryByPath(struct grubConfig *config,
 	int i;
 	char *chptr;
 	enum lineType_e checkType = LT_KERNEL;
+	//We need to search for LT_CHAINLOADER if it is chainloader
+	if(config->isChainloader)
+		checkType = LT_CHAINLOADER;
 
 	if (isdigit(*kernel)) {
 		int *indexVars = alloca(sizeof(*indexVars) * strlen(kernel));
@@ -2469,6 +2480,8 @@ struct singleEntry *findEntryByPath(struct grubConfig *config,
 				else if (checkType & LT_KERNEL)
 					ct = checkType | LT_KERNEL_EFI |
 					    LT_KERNEL_16;
+				else if (checkType & LT_CHAINLOADER)
+					ct = checkType | LT_CHAINLOADER;
 				line = getLineByType(ct, line);
 				if (!line)
 					break;	/* not found in this entry */
@@ -2492,7 +2505,7 @@ struct singleEntry *findEntryByPath(struct grubConfig *config,
 			 */
 			if (line
 			    && getLineByType(LT_KERNEL | LT_HYPER |
-					     LT_KERNEL_EFI | LT_KERNEL_16,
+					     LT_KERNEL_EFI | LT_KERNEL_16 | LT_CHAINLOADER,
 					     entry->lines))
 				break;	/* found 'im! */
 		}
@@ -3378,10 +3391,10 @@ struct singleLine *addLineTmpl(struct singleEntry *entry,
 		/* override the inherited value with our own.
 		 * This is a little weak because it only applies to elements[1]
 		 */
-		if (newLine->numElements > 1)
-			removeElement(newLine, 1);
-		insertElement(newLine, val, 1, cfi);
-
+		if(tmplLine->type != LT_SEARCH && tmplLine->type != LT_CHAINLOADER) {
+			if (newLine->numElements > 1)
+				removeElement(newLine, 1);
+			insertElement(newLine, val, 1, cfi);
 		/* but try to keep the rootspec from the template... sigh */
 		if (tmplLine->
 		    type & (LT_HYPER | LT_KERNEL | LT_MBMODULE | LT_INITRD |
@@ -3405,6 +3418,7 @@ struct singleLine *addLineTmpl(struct singleEntry *entry,
 					"%.*s%s", (int) rs, prfx, val);
 			}
 		}
+	}
 	}
 
 	dbgPrintf("addLineTmpl(%s)\n", newLine->numElements ?
@@ -3445,7 +3459,8 @@ struct singleLine *addLine(struct singleEntry *entry,
 		tmpl.elements[0].indent = "";
 		val = NULL;
 	} else if (type == LT_MENUENTRY) {
-		char *lineend = "--class gnu-linux --class gnu --class os {";
+			char *lineend_chain = " {";
+			char *lineend = "--class gnu-linux --class gnu --class os {";
 		if (!val) {
 			fprintf(stderr,
 				"Line type LT_MENUENTRY requires a value\n");
@@ -3469,8 +3484,34 @@ struct singleLine *addLine(struct singleEntry *entry,
 		tmpl.elements[1].item = (char *)val;
 		tmpl.elements[1].indent = alloca(2);
 		sprintf(tmpl.elements[1].indent, "%c", kw->nextChar);
-		tmpl.elements[2].item = alloca(strlen(lineend) + 1);
-		strcpy(tmpl.elements[2].item, lineend);
+		if(cfi->isChainloader) {
+			tmpl.elements[2].item = alloca(strlen(lineend_chain) + 1);
+			strcpy(tmpl.elements[2].item, lineend_chain);
+		} else {
+			tmpl.elements[2].item = alloca(strlen(lineend) + 1);
+			strcpy(tmpl.elements[2].item, lineend);
+		}
+		tmpl.elements[2].indent = "";
+	} else if(type == LT_SEARCH) {
+		char *linemid = "--no-floppy --set=root -f";
+		kw = getKeywordByType(type, cfi);
+		if (!kw) {
+			fprintf(stderr,
+				"Looking up keyword for unknown type %d\n",
+				type);
+			abort();
+		}
+		tmpl.type = type;
+		tmpl.numElements = 3;
+		tmpl.elements =
+		    alloca(sizeof(*tmpl.elements) * tmpl.numElements);
+		tmpl.elements[0].item = kw->key;
+		tmpl.elements[0].indent = alloca(2);
+		sprintf(tmpl.elements[0].indent, "%c", kw->nextChar);
+		tmpl.elements[1].item = alloca(strlen(linemid) + 1);
+		strcpy(tmpl.elements[1].item, linemid);
+		tmpl.elements[1].indent = " ";
+		tmpl.elements[2].item = (char *)val;
 		tmpl.elements[2].indent = "";
 	} else {
 		kw = getKeywordByType(type, cfi);
@@ -3505,7 +3546,6 @@ struct singleLine *addLine(struct singleEntry *entry,
 		if (!line->next && !prev)
 			prev = line;
 	}
-
 	struct singleLine *menuEntry;
 	menuEntry = getLineByType(LT_MENUENTRY, entry->lines);
 	if (tmpl.type == LT_ENTRY_END) {
@@ -4523,7 +4563,7 @@ int addNewKernel(struct grubConfig *config, struct singleEntry *template,
 		 const char *newKernelArgs, const char *newKernelInitrd,
 		 const char **extraInitrds, int extraInitrdCount,
 		 const char *newMBKernel, const char *newMBKernelArgs,
-		 const char *newDevTreePath, int newIndex)
+		 const char *newDevTreePath, int newIndex, const char *newChainloaderPath)
 {
 	struct singleEntry *new, *entry, *prev = NULL;
 	struct singleLine *newLine = NULL, *tmplLine = NULL, *masterLine = NULL;
@@ -4532,7 +4572,7 @@ int addNewKernel(struct grubConfig *config, struct singleEntry *template,
 	char *chptr;
 	int rc;
 
-	if (!newKernelPath)
+	if (!newKernelPath && !newChainloaderPath)
 		return 0;
 
 	rc = asprintf(&indexs, "%d", newIndex);
@@ -4577,7 +4617,12 @@ int addNewKernel(struct grubConfig *config, struct singleEntry *template,
 		config->entries = new;
 
 	/* copy/update from the template */
-	needs = NEED_KERNEL | NEED_TITLE;
+	if (newKernelPath)
+		needs = NEED_KERNEL | NEED_TITLE;
+
+	if (newChainloaderPath)
+		needs = NEED_CHAINLOADER | NEED_TITLE | NEED_SEARCH;
+
 	if (newKernelInitrd)
 		needs |= NEED_INITRD;
 	if (newMBKernel) {
@@ -4587,6 +4632,7 @@ int addNewKernel(struct grubConfig *config, struct singleEntry *template,
 	if (newDevTreePath && getKeywordByType(LT_DEVTREE, config->cfi))
 		needs |= NEED_DEVTREE;
 
+	//TODO: Ignoring template=true for add-chainloader for now.
 	if (template) {
 		for (masterLine = template->lines;
 		     masterLine && (tmplLine = lineDup(masterLine));
@@ -4889,8 +4935,8 @@ int addNewKernel(struct grubConfig *config, struct singleEntry *template,
 		}
 
 	} else {
-		/* don't have a template, so start the entry with the 
-		 * appropriate starting line 
+		/* don't have a template, so start the entry with the
+		 * appropriate starting line
 		 */
 		switch (config->cfi->entryStart) {
 		case LT_KERNEL:
@@ -4998,6 +5044,26 @@ int addNewKernel(struct grubConfig *config, struct singleEntry *template,
 				  newKernelPath + strlen(prefix));
 		needs &= ~NEED_KERNEL;
 	}
+
+	if (needs & NEED_SEARCH) {
+		newLine = addLine(new, config->cfi, LT_SEARCH,
+				  config->primaryIndent, newChainloaderPath + strlen(prefix));
+		needs &= ~NEED_SEARCH;
+	}
+
+	if (needs & NEED_CHAINLOADER) {
+		newLine = addLine(new, config->cfi,
+				  (new->multiboot
+				   && getKeywordByType(LT_MBMODULE,
+						       config->cfi))
+				  ? LT_MBMODULE : preferredLineType(LT_CHAINLOADER,
+								    config->
+								    cfi),
+				  config->secondaryIndent,
+				  newChainloaderPath + strlen(prefix));
+
+		needs &= ~NEED_CHAINLOADER;
+	}
 	if (needs & NEED_MB) {
 		newLine = addLine(new, config->cfi, LT_HYPER,
 				  config->secondaryIndent,
@@ -5062,7 +5128,9 @@ int main(int argc, const char **argv)
 	int extraInitrdCount = 0;
 	char *updateKernelPath = NULL;
 	char *newKernelPath = NULL;
+	char *newChainloaderPath = NULL;
 	char *removeKernelPath = NULL;
+	char *removeChainloaderPath = NULL;
 	char *newKernelArgs = NULL;
 	char *newKernelInitrd = NULL;
 	char *newKernelTitle = NULL;
@@ -5090,6 +5158,8 @@ int main(int argc, const char **argv)
 	struct poptOption options[] = {
 		{"add-kernel", 0, POPT_ARG_STRING, &newKernelPath, 0,
 		 _("add an entry for the specified kernel"), _("kernel-path")},
+		{"add-chainloader", 0, POPT_ARG_STRING, &newChainloaderPath, 0,
+		 _("add an entry for chainloading a secondary bootloader"), _("kernel-path")},
 		{"add-multiboot", 0, POPT_ARG_STRING, &newMBKernel, 0,
 		 _("add an entry for the specified multiboot kernel"), NULL},
 		{"args", 0, POPT_ARG_STRING, &newKernelArgs, 0,
@@ -5169,6 +5239,9 @@ int main(int argc, const char **argv)
 		 _("remove multiboot kernel arguments"), NULL},
 		{"remove-kernel", 0, POPT_ARG_STRING, &removeKernelPath, 0,
 		 _("remove all entries for the specified kernel"),
+		 _("kernel-path")},
+		{"remove-chainloader", 0, POPT_ARG_STRING, &removeChainloaderPath, 0,
+		 _("remove all entries for the specified secondary bootloader"),
 		 _("kernel-path")},
 		{"remove-multiboot", 0, POPT_ARG_STRING, &removeMBKernel, 0,
 		 _("remove all entries for the specified multiboot kernel"),
@@ -5316,7 +5389,8 @@ int main(int argc, const char **argv)
 	}
 
 	if (bootloaderProbe && (displayDefault || kernelInfo ||
-				newKernelPath || removeKernelPath || makeDefault
+				newKernelPath || removeKernelPath || newChainloaderPath
+				|| removeChainloaderPath|| makeDefault
 				|| defaultKernel || displayDefaultIndex
 				|| displayDefaultTitle
 				|| (defaultIndex >= 0))) {
@@ -5330,6 +5404,18 @@ int main(int argc, const char **argv)
 					       removeKernelPath)) {
 		fprintf(stderr, _("grubby: --default-kernel and --info may not "
 				  "be used when adding or removing kernels\n"));
+		return 1;
+	}
+
+	if ((displayDefault || kernelInfo) && (newChainloaderPath ||
+					       removeChainloaderPath)) {
+		fprintf(stderr, _("grubby: --default-kernel and --info may not "
+				  "be used when adding or removing chainloader entries\n"));
+		return 1;
+	}
+
+	if (newChainloaderPath && !newKernelTitle) {
+		fprintf(stderr, _("grubby: chainloader title must be specified\n"));
 		return 1;
 	}
 
@@ -5379,12 +5465,19 @@ int main(int argc, const char **argv)
 	if (!removeKernelPath && !newKernelPath && !displayDefault
 	    && !defaultKernel && !kernelInfo && !bootloaderProbe
 	    && !updateKernelPath && !removeMBKernel && !displayDefaultIndex
-	    && !displayDefaultTitle && (defaultIndex == -1)) {
+	    && !displayDefaultTitle && !newChainloaderPath && !removeChainloaderPath
+	    && (defaultIndex == -1)) {
 		fprintf(stderr, _("grubby: no action specified\n"));
 		return 1;
 	}
 
 	flags |= badImageOkay ? GRUBBY_BADIMAGE_OKAY : 0;
+
+	//We dont need boot prefix if it is chainloading
+	if (removeChainloaderPath || newChainloaderPath) {
+		cfi->needsBootPrefix = 0;
+		cfi->isChainloader = 1;
+	}
 
 	if (cfi->needsBootPrefix) {
 		if (!bootPrefix) {
@@ -5496,6 +5589,11 @@ int main(int argc, const char **argv)
 	if (!config)
 		return 1;
 
+	if (removeChainloaderPath || newChainloaderPath)
+		config->isChainloader = 1;
+	else
+		config->isChainloader = 0;
+
 	if (displayDefault) {
 		struct singleLine *line;
 		struct singleEntry *entry;
@@ -5577,6 +5675,8 @@ int main(int argc, const char **argv)
 		if (!template)
 			return 1;
 	}
+	if(removeChainloaderPath)
+		markRemovedImage(config, removeChainloaderPath, "");
 
 	markRemovedImage(config, removeKernelPath, bootPrefix);
 	markRemovedImage(config, removeMBKernel, bootPrefix);
@@ -5603,7 +5703,7 @@ int main(int argc, const char **argv)
 			 newKernelTitle, newKernelArgs, newKernelInitrd,
 			 (const char **)extraInitrds, extraInitrdCount,
 			 newMBKernel, newMBKernelArgs, newDevTreePath,
-			 newIndex))
+			 newIndex, newChainloaderPath))
 		return 1;
 
 	if (numEntries(config) == 0) {
